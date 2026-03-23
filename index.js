@@ -244,14 +244,30 @@ app.get("/hr/tasks", async (req, res) => {
 app.post("/hr/tasks", async (req, res) => {
   const token = req.headers["x-hr-token"];
   if (token !== process.env.HR_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
-  const { title, description, required_skills } = req.body;
+  const { title, description, required_skills, priority, category } = req.body;
   const { data, error } = await supabase.from("tasks").insert({
-    title, description,
-    required_skills: Array.isArray(required_skills) ? required_skills : required_skills.split(",").map(s => s.trim()),
+    title,
+    description,
+    required_skills: Array.isArray(required_skills)
+      ? required_skills
+      : required_skills.split(",").map(s => s.trim()),
+    priority: priority || "Medium",
+    category: category || "General",
     status: "Unassigned"
   }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
+});
+
+app.patch("/hr/tasks/:id", async (req, res) => {
+  const token = req.headers["x-hr-token"];
+  if (token !== process.env.HR_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
+  const { status, assigned_to, assigned_name, ai_reasoning } = req.body;
+  const { error } = await supabase.from("tasks").update({
+    status, assigned_to, assigned_name, ai_reasoning
+  }).eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
 });
 
 app.delete("/hr/tasks/:id", async (req, res) => {
@@ -266,27 +282,37 @@ app.post("/hr/tasks/:id/assign", async (req, res) => {
   const token = req.headers["x-hr-token"];
   if (token !== process.env.HR_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
 
-  const { data: task, error: taskError } = await supabase.from("tasks").select("*").eq("id", req.params.id).single();
+  const { data: task, error: taskError } = await supabase
+    .from("tasks").select("*").eq("id", req.params.id).single();
   if (taskError || !task) return res.status(404).json({ error: "Task not found" });
 
-  const { data: employees, error: empError } = await supabase.from("employees").select("*").eq("status", "Active");
-  if (empError || !employees.length) return res.status(500).json({ error: "Could not fetch employees" });
+  const { data: employees, error: empError } = await supabase
+    .from("employees").select("*").eq("status", "Active");
+  if (empError || !employees || employees.length === 0) {
+    return res.status(500).json({ error: "No active employees found" });
+  }
 
-  const prompt = `You are an AI task assignment system for an IT company. Match the best employee to this task based on skill overlap.
+  const prompt = `You are an AI task assignment system. Your job is to match the best employee to a task based on skill overlap.
 
-Task:
+Task Details:
 - Title: ${task.title}
-- Description: ${task.description}
-- Required Skills: ${task.required_skills?.join(", ")}
+- Description: ${task.description || "No description provided"}
+- Required Skills: ${Array.isArray(task.required_skills) ? task.required_skills.join(", ") : task.required_skills}
 
 Available Employees:
-${employees.map(e => `- ID: ${e.id} | Name: ${e.name} | Role: ${e.role} | Department: ${e.department} | Skills: ${e.skills?.join(", ")}`).join("\n")}
+${employees.map(e => `- ID: ${e.id} | Name: ${e.name} | Role: ${e.role} | Department: ${e.department} | Skills: ${Array.isArray(e.skills) ? e.skills.join(", ") : e.skills}`).join("\n")}
 
-Pick the single best match based on skill overlap. Return ONLY this JSON:
+Instructions:
+1. Compare the required skills against each employee's skill set
+2. Pick the SINGLE best match based on skill overlap and role relevance
+3. If multiple employees match, pick the one with the most relevant skills
+4. Return ONLY valid JSON, no extra text
+
+Return this EXACT JSON:
 {
-  "assignedId": "the employee uuid",
-  "assignedName": "the employee name",
-  "reasoning": "2-3 sentences explaining why this employee is the best match"
+  "assignedId": "the exact employee uuid from the list above",
+  "assignedName": "the employee full name",
+  "reasoning": "2-3 sentences explaining exactly why this employee is the best match, referencing specific skills they have"
 }`;
 
   try {
@@ -300,15 +326,21 @@ Pick the single best match based on skill overlap. Return ONLY this JSON:
         model: "llama-3.3-70b-versatile",
         messages: [{ role: "user", content: prompt }],
         max_tokens: 500,
-        temperature: 0.3
+        temperature: 0.2
       })
     });
 
     const data = await response.json();
-    if (!data.choices || !data.choices[0]) return res.status(500).json({ error: "AI error" });
+    if (!data.choices || !data.choices[0]) {
+      return res.status(500).json({ error: "AI returned no response" });
+    }
 
     const text = data.choices[0].message.content.replace(/```json|```/g, "").trim();
     const result = JSON.parse(text);
+
+    if (!result.assignedId || !result.assignedName) {
+      return res.status(500).json({ error: "AI response missing required fields" });
+    }
 
     const { error: updateError } = await supabase.from("tasks").update({
       assigned_to: result.assignedId,
@@ -318,7 +350,12 @@ Pick the single best match based on skill overlap. Return ONLY this JSON:
     }).eq("id", req.params.id);
 
     if (updateError) return res.status(500).json({ error: updateError.message });
-    res.json({ success: true, assignedName: result.assignedName, reasoning: result.reasoning });
+
+    res.json({
+      success: true,
+      assignedName: result.assignedName,
+      reasoning: result.reasoning
+    });
 
   } catch (err) {
     console.error("Task assignment error:", err);
@@ -330,7 +367,8 @@ app.post("/hr/candidates/:id/hire", async (req, res) => {
   const token = req.headers["x-hr-token"];
   if (token !== process.env.HR_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
 
-  const { data: candidate, error: candError } = await supabase.from("candidates").select("*").eq("id", req.params.id).single();
+  const { data: candidate, error: candError } = await supabase
+    .from("candidates").select("*").eq("id", req.params.id).single();
   if (candError || !candidate) return res.status(404).json({ error: "Candidate not found" });
 
   await supabase.from("candidates").update({ status: "Hired" }).eq("id", req.params.id);
@@ -359,14 +397,50 @@ app.get("/hr/candidates/export", async (req, res) => {
   if (token !== process.env.HR_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
   const { data, error } = await supabase.from("candidates").select("*").order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
-  const headers = ["name","email","primary_strength","clifton_theme","role_id","confidence","hire_recommendation","status","created_at"];
+  const hdrs = ["name","email","primary_strength","clifton_theme","role_id","confidence","hire_recommendation","status","created_at"];
   const csv = [
-    headers.join(","),
-    ...data.map(c => headers.map(h => `"${(c[h] || "").toString().replace(/"/g, '""')}"`).join(","))
+    hdrs.join(","),
+    ...data.map(c => hdrs.map(h => `"${(c[h] || "").toString().replace(/"/g, '""')}"`).join(","))
   ].join("\n");
   res.setHeader("Content-Type", "text/csv");
   res.setHeader("Content-Disposition", "attachment; filename=candidates.csv");
   res.send(csv);
+});
+
+app.get("/hr/jobs", async (req, res) => {
+  const token = req.headers["x-hr-token"];
+  if (token !== process.env.HR_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
+  const { data, error } = await supabase.from("jobs").select("*").order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post("/hr/jobs", async (req, res) => {
+  const token = req.headers["x-hr-token"];
+  if (token !== process.env.HR_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
+  const { title, department, type, status } = req.body;
+  const { data, error } = await supabase.from("jobs").insert({
+    title, department, type: type || "Full-time", status: status || "Open"
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.patch("/hr/jobs/:id", async (req, res) => {
+  const token = req.headers["x-hr-token"];
+  if (token !== process.env.HR_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
+  const { title, department, type, status } = req.body;
+  const { error } = await supabase.from("jobs").update({ title, department, type, status }).eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+app.delete("/hr/jobs/:id", async (req, res) => {
+  const token = req.headers["x-hr-token"];
+  if (token !== process.env.HR_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
+  const { error } = await supabase.from("jobs").delete().eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
 });
 
 app.listen(process.env.PORT, () => {
